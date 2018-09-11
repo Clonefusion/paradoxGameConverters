@@ -461,6 +461,8 @@ void HoI4Country::convertConvoys(const map<string, HoI4::UnitMap>& unitMap)
 
 void HoI4Country::convertAirforce(const map<string, HoI4::UnitMap>& unitMap)
 {
+        static std::map<std::string, vector<std::string>> backups = {
+            {"fighter_equipment_0", {"tac_bomber_equipment_0"}}};
         for (auto army : srcCountry->getArmies())
 	{
 		for (auto regiment : army->getRegiments())
@@ -471,17 +473,46 @@ void HoI4Country::convertAirforce(const map<string, HoI4::UnitMap>& unitMap)
 			{
 				HoI4::UnitMap unitInfo = unitMap.at(type);
 
-				if (unitInfo.getCategory() == "air") {
-					// Air units get placed in national stockpile
-					equipmentStockpile[unitInfo.getEquipment()] = equipmentStockpile[unitInfo.getEquipment()] + unitInfo.getSize();
-				}
-			}
-			else
+                                if (unitInfo.getCategory() != "air")
+                                {
+                                        continue;
+                                }
+
+                                // Air units get placed in national stockpile.
+                                string equip = unitInfo.getEquipment();
+                                int amount = unitInfo.getSize();
+                                const auto& bkup = backups.find(equip);
+                                if (bkup != backups.end())
+                                {
+                                  amount /= (1 + bkup->second.size());
+                                        for (const auto& b : bkup->second)
+                                        {
+                                                equipmentStockpile[b] += amount;
+                                        }
+                                }
+                                equipmentStockpile[equip] += amount;
+                        }
+                        else
 			{
 				LOG(LogLevel::Warning) << "Unknown unit type: " << type;
 			}
 		}
 	}	
+}
+
+bool sufficientUnits(map<string, int>& units, map<string, string> subs,
+                     map<string, int>& req)
+{
+        for (auto unit : req)
+        {
+                int available = units[unit.first];
+                available += units[subs[unit.first]];
+                if (available < unit.second)
+                {
+                        return false;
+                }
+        }
+        return true;
 }
 
 void HoI4Country::convertArmyDivisions(const map<string, HoI4::UnitMap>& unitMap, const vector<HoI4::DivisionTemplateType>& divisionTemplates)
@@ -492,8 +523,9 @@ void HoI4Country::convertArmyDivisions(const map<string, HoI4::UnitMap>& unitMap
 	}
 
 	map<string, int> BattalionsAndCompanies;
+        map<string, string> substitutes;
+        substitutes["artillery"] = "artillery_brigade";
         map<string, int> vicRegiments;
-        static map<string, bool> infoPrinted;
 
 	for (auto army : srcCountry->getArmies())
 	{
@@ -513,15 +545,6 @@ void HoI4Country::convertArmyDivisions(const map<string, HoI4::UnitMap>& unitMap
 				if (unitInfo.getCategory() == "land") {
 					// Calculate how many Battalions and Companies are available after mapping Vic2 armies
 					BattalionsAndCompanies[unitInfo.getType()] += unitInfo.getSize();
-                                        if (!infoPrinted[unitInfo.getType()])
-                                        {
-                                                infoPrinted[unitInfo.getType()] = true;
-                                                LOG(LogLevel::Info)
-                                                    << "Unit type "
-                                                    << unitInfo.getType()
-                                                    << " has size "
-                                                    << unitInfo.getSize();
-                                        }
                                 }
                         }
 			else
@@ -540,9 +563,10 @@ void HoI4Country::convertArmyDivisions(const map<string, HoI4::UnitMap>& unitMap
         }
 
         map<string, int> createdDivs;
+        int totalDivCount = 0;
 	for (auto& divTemplate: divisionTemplates)
 	{
-		// for each template determine the Battalion and Company requirements
+		// For each template determine the Battalion and Company requirements.
 		int divisionCounter = 1;
 
 		map<string, int> templateRequirements;
@@ -555,44 +579,71 @@ void HoI4Country::convertArmyDivisions(const map<string, HoI4::UnitMap>& unitMap
 			templateRequirements[regiment.getType()] = templateRequirements[regiment.getType()] + 1;
 		}
 
-		bool sufficientUnits = true;
-		for (auto unit : templateRequirements)
-		{
-			if (BattalionsAndCompanies[unit.first] < unit.second)
-			{
-				sufficientUnits = false;
-			}
-		}
+                // Create new divisions as long as sufficient units exist,
+                // otherwise move on to next template
+                while (sufficientUnits(BattalionsAndCompanies, substitutes,
+                                       templateRequirements))
+                {
+                        HoI4::DivisionType newDivision(
+                            to_string(divisionCounter) + ". " +
+                                divTemplate.getName(),
+                            divTemplate.getName(),
+                            capitalState->getVPLocation());
 
-		// Create new divisions as long as sufficient units exist, otherwise move on to next template
-		while (sufficientUnits == true) 
-		{
-			HoI4::DivisionType newDivision(to_string(divisionCounter) + ". " + divTemplate.getName(), divTemplate.getName(), capitalState->getVPLocation());
-			divisionCounter++;
-			divisions.push_back(newDivision);
-                        createdDivs[divTemplate.getName()]++;
-
-			for (auto& unit : templateRequirements)
-			{
-				BattalionsAndCompanies[unit.first] -= unit.second;
-			}
-
-			sufficientUnits = true;
-			for (auto unit : templateRequirements)
-			{
-				if (BattalionsAndCompanies[unit.first] < unit.second)
-				{
-					sufficientUnits = false;
-				}
-			}
-		}	
-	}
-        LOG(LogLevel::Info) << srcCountry->getIdentifier() << " gets divisions:";
-        for (const auto& cd : createdDivs) {
+                        for (auto& unit : templateRequirements)
+                        {
+                                for (int i = 0; i < unit.second; ++i)
+                                {
+                                        if (BattalionsAndCompanies[unit.first] > 0)
+                                        {
+                                                BattalionsAndCompanies[unit.first]--;
+                                        }
+                                        else
+                                        {
+                                                BattalionsAndCompanies[substitutes[unit.first]]--;
+                                        }
+                                }
+                        }
+                        bool dropDivision = true;
+                        if (totalDivCount < 25)
+                        {
+                                dropDivision = false;
+                        }
+                        else if (totalDivCount < 100)
+                        {
+                                dropDivision = (totalDivCount % 3 != 0);
+                        }
+                        else
+                        {
+                                dropDivision = (totalDivCount % 5 != 0);
+                        }
+                        if (!dropDivision)
+                        {
+                                divisionCounter++;
+                                divisions.push_back(newDivision);
+                                createdDivs[divTemplate.getName()]++;
+                        }
+                        totalDivCount++;
+                }
+        }
+        LOG(LogLevel::Info)
+            << srcCountry->getIdentifier() << " gets divisions:";
+        for (const auto& cd : createdDivs)
+        {
                 LOG(LogLevel::Info) << "  " << cd.first << " = " << cd.second;
         }
+        LOG(LogLevel::Info)
+            << srcCountry->getIdentifier() << " has leftover components:";
+        for (const auto& bc : BattalionsAndCompanies)
+        {
+                if (bc.second == 0)
+                {
+                        continue;
+                }
+                LOG(LogLevel::Info) << "  " << bc.first << " = " << bc.second;
+        }
 
-	/*
+        /*
 	// get the total number of source brigades and the number of source brigades per location
 	int infantryBrigades = 0;
 	int artilleryBrigades = 0;
